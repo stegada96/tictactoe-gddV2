@@ -1,559 +1,981 @@
-// screens/HomeScreen.js
+// screens/GameScreen.js
+// AGGIORNAMENTI:
+// - Timer turno online: barra che si svuota, lampeggia rosso ultimi 5s
+// - Timeout: AI easy fa la mossa per il giocatore
+// - 2° timeout consecutivo dello stesso giocatore → sconfitta
+// - Local: nessun timer
+// - Doppia partita: forfeit → leg1Forfeit:true passato al GameResultScreen
 
-import React, { useContext, useState, useEffect, useRef, useCallback } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView } from 'react-native';
+import React, { useContext, useState, useEffect, useCallback, useRef } from 'react';
+import {
+  View, Text, TouchableOpacity, StyleSheet,
+  Dimensions, Animated, Vibration, Modal, AppState,
+} from 'react-native';
 import { AppContext } from '../App';
 import CONFIG from '../config';
-import { logNav } from '../utils/debug';
+import { logGame, logAI, logError, validateGameState } from '../utils/debug';
 import {
-  minutesToPlayable, getPlayer, getIngots,
-  claimDailyBonus, getStore, canWatchVideo, getCredits,
-  getDailyStreak,
-} from '../utils/storage';
-import StreakCard from '../components/StreakCard';
-import {
-  getChestStatus, claimChestReward, getCalendarStatus, claimCalendarReward,
-  claimComebackBonus, getRewardState,
-} from '../utils/rewardSystems';
-import { playStreakClaim, playChestOpen, playCalendarClaim, playComebackBonus } from '../utils/audioManager';
-import { showRewardedAd } from '../services/ads';
+  createClassicState, makeMoveClassic,
+  createUltimateState, makeMoveUltimate,
+  createRandomState,
+} from '../utils/gameLogic';
+import { getAIMove, randomFirstPlayer, getThinkingDelay } from '../utils/ai';
+import { updateStats, incrementGamesSession, recordAdShown, canWatchVideo, getStore } from '../utils/storage';
+import { incrementWeeklyGames, updateLastActive } from '../utils/rewardSystems';
+import { shouldShowAd as adsCheckShouldShow, showInterstitial, onInterstitialDismissed, getAdsState, showRewardedAd } from '../services/ads';
+import { recordLocalResult } from '../utils/localSession';
 import { theme as getTheme } from '../utils/theme';
 import { t, useLang } from '../utils/i18n';
-import { getMissionsWithState } from '../utils/missions';
-import { getXpProgress } from '../utils/xpUtils';
+import VariantIcon from '../components/VariantIcon';
+import RandomSpinWheel from '../components/RandomSpinWheel';
 
+const { width } = Dimensions.get('window');
+const TURN_SEC  = CONFIG.ONLINE_TURN_SECONDS || 15;
+const DANGER    = CONFIG.TIMER_DANGER_SECONDS || 5;
 
-const getDailyVariant = () => {
-  const now  = new Date();
-  const seed = now.getFullYear() * 10000 + (now.getMonth() + 1) * 100 + now.getDate();
-  const pool = CONFIG.VARIANT_ORDER.filter(id => id !== 'random');
-  const id   = pool[seed % pool.length];
-  return Object.values(CONFIG.GAME_VARIANTS).find(v => v.id === id);
-};
-
-const getChaosWeekRule = () => {
-  if (!CONFIG.CHAOS_WEEK_ENABLED) return null;
-  const now   = new Date();
-  const start = new Date(now.getFullYear(), 0, 1);
-  const week  = Math.floor((now - start) / (7 * 24 * 3600 * 1000));
-  return (CONFIG.CHAOS_WEEK_RULES || [])[week % (CONFIG.CHAOS_WEEK_RULES || []).length] || null;
-};
-
-const getSeasonDaysLeft = () => {
-  const now = new Date();
-  return Math.max(0, new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate() - now.getDate());
-};
-
-function getMissionText(m) {
-  if (!m) return '';
-  const varName = m.variantId
-    ? Object.values(CONFIG.GAME_VARIANTS || {}).find(v => v.id === m.variantId)?.name || m.variantId
-    : '';
-  switch (m.type) {
-    case 'games_played': return t('missGamesPlayed', { n: m.target });
-    case 'wins':         return t('missWins',        { n: m.target });
-    case 'ai_wins':      return t('missAIWins',      { n: m.target });
-    case 'streak':       return t('missStreak',      { n: m.target });
-    case 'variant':      return t('missVariant',     { n: m.target, variant: varName });
-    default:             return m.type;
-  }
-}
-
-export default function HomeScreen() {
-  const { navigate, credits, unlimitedActive, refreshCredits } = useContext(AppContext);
-  useLang();
-  const th = getTheme();
-
-  const [player,          setPlayer]         = useState(null);
-  const [ingots,          setIngots]          = useState(0);
-  const [minToPlay,       setMinToPlay]       = useState(0);
-  const [nextObj,         setNextObj]         = useState(null);
-  const [completedCount,  setCompletedCount]  = useState(0);
-  const [hasMissionBadge, setMissionBadge]    = useState(false);
-  const [seasonLeft,      setSeasonLeft]      = useState(0);
-  const [chaosRule,       setChaosRule]       = useState(null);
-  const [ctaLoading,      setCtaLoading]      = useState(false);
-  // isOffline: riservato per futura integrazione NetInfo
-  // const [isOffline, setIsOffline] = useState(false);
-  const _mounted = useRef(true);  // guard setState su componente smontato
-  const [streakInfo,     setStreakInfo]      = useState(getDailyStreak());
-  const [comebackBonus,  setComebackBonus]  = useState(null);
-  const [chestStatus,    setChestStatus]    = useState(null);
-
-  // QUICK_PLAY_COST = costo quick play online (classic) = 4cr, allineato con onlineCost di config
-  const ONLINE_COST = CONFIG.QUICK_PLAY_COST || 4;
-  const CMAX        = CONFIG.CREDITS_MAX     || 200;
-  const hasEnough   = unlimitedActive || (credits || 0) >= ONLINE_COST;
-
-  const load = useCallback(async () => {
-    try {
-      const [p, ing] = await Promise.all([getPlayer(), getIngots()]);
-      if (!_mounted.current) return;
-      setPlayer(p);
-      setIngots(ing || 0);
-      const enoughNow = unlimitedActive || (credits || 0) >= ONLINE_COST;
-      if (!enoughNow) setMinToPlay(minutesToPlayable(ONLINE_COST));
-
-      const allPeriods = ['daily', 'weekly', 'monthly', 'alltime'];
-      let pending = 0;
-      let bestMission = null;
-
-      for (const period of allPeriods) {
-        try {
-          const ms = getMissionsWithState(period);
-          pending += ms.filter(m => m.completed && !m.claimed).length;
-          if (!bestMission) {
-            const ip = ms.filter(m => !m.completed && !m.claimed && (m.target || 0) > 0 && (m.progress || 0) > 0);
-            if (ip.length) bestMission = ip.sort((a, b) => (b.progress / b.target) - (a.progress / a.target))[0];
-          }
-        } catch (e) { /* intentionally ignored */ }
-      }
-      setCompletedCount(pending);
-      setMissionBadge(pending > 0);
-
-      const store      = getStore ? getStore() : null;
-      const bonusReady = store ? store.lastDaily !== new Date().toDateString() : false;
-      const dv         = getDailyVariant();
-
-      if (bestMission)                          setNextObj({ type: 'mission',   mission: bestMission });
-      else if (bonusReady)                      setNextObj({ type: 'bonus' });
-      else if (CONFIG.DAILY_PASS_ENABLED && dv) setNextObj({ type: 'challenge', variant: dv });
-      else                                      setNextObj(null);
-
-      setSeasonLeft(getSeasonDaysLeft());
-      setChaosRule(getChaosWeekRule());
-      // Aggiorna streak info (leggera, dallo store in-memory)
-      if (_mounted.current) setStreakInfo(getDailyStreak());
-
-      // Carica chest e comeback bonus (safe — non blocca se reward system non inizializzato)
-      try {
-        const cs = getChestStatus();
-        if (_mounted.current) setChestStatus(cs);
-        const rs = getRewardState();
-        if (rs?.comeback?.bonusLevel > 0 && !rs?.comeback?.bonusClaimed) {
-          if (_mounted.current) setComebackBonus(rs.comeback);
-        }
-      } catch (_) { /* reward system non ancora caricato — silenzioso */ }
-    } catch (e) { /* intentionally ignored */ }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [credits, unlimitedActive, ONLINE_COST]); // stable load function
+// ── Componente Timer Barra ────────────────────────────────
+// Visibile solo in modalità online, non in locale
+function TurnTimerBar({ seconds, totalSeconds, th }) {
+  const blinkAnim = useRef(new Animated.Value(1)).current;
+  const isDanger  = seconds <= DANGER;
 
   useEffect(() => {
-    _mounted.current = true;
-    load();
-    const iv = setInterval(load, 30000);
-    return () => { _mounted.current = false; clearInterval(iv); };
-  }, [load]); // load è stabile con useCallback — warning risolto
+    if (!isDanger) { blinkAnim.setValue(1); return; }
+    const anim = Animated.loop(
+      Animated.sequence([
+        Animated.timing(blinkAnim, { toValue:0.15, duration:CONFIG.TIMER_BLINK_INTERVAL||400, useNativeDriver:true }),
+        Animated.timing(blinkAnim, { toValue:1,    duration:CONFIG.TIMER_BLINK_INTERVAL||400, useNativeDriver:true }),
+      ])
+    );
+    anim.start();
+    return () => anim.stop();
+  }, [isDanger]);
 
-  const handleStreakClaim = useCallback(async () => {
-    try {
-      await claimDailyBonus();
-      await refreshCredits();
-      if (_mounted.current) {
-        setStreakInfo(getDailyStreak());
-        load(); // aggiorna nextObj (rimuove card bonus se era la prossima task)
-      }
-    } catch (e) { /* intentionally ignored */ }
-  }, [refreshCredits, load]); // refreshCredits e load sono stabili useCallback
-
-  const handleComebackClaim = useCallback(async () => {
-    try {
-      playComebackBonus();
-      await claimComebackBonus();
-      await refreshCredits();
-      if (_mounted.current) setComebackBonus(null);
-    } catch (e) { /* intentionally ignored */ }
-  }, [refreshCredits]);
-
-  const handleStreakDouble = useCallback(async () => {
-    await refreshCredits();
-    if (_mounted.current) setStreakInfo(getDailyStreak());
-  }, [refreshCredits]);
-
-  const handleCTA = useCallback(async () => {
-    if (hasEnough) { navigate('play'); return; }
-    // Doppio tap: ctaLoading blocca seconda chiamata
-    if (!canWatchVideo() || ctaLoading) return;
-    setCtaLoading(true);
-    let didNavigate = false;
-    try {
-      await showRewardedAd(async () => {
-        // Callback SOLO se rewardedVideoUserDidEarnReward — mai se chiuso prima
-        await refreshCredits();
-        const nowCredits = await getCredits(); // leggi dallo store, non dalla closure stale
-        if (unlimitedActive || nowCredits >= ONLINE_COST) {
-          didNavigate = true;
-          navigate('play'); // dopo rewarded video → vai a PlayScreen
-        }
-      });
-    } catch (e) {
-      /* Rewarded ad SDK error — reset loading, no credits awarded */
-    } finally {
-      // Se abbiamo navigato, il componente sarà smontato — no setState su componente morto
-      if (!didNavigate && _mounted.current) setCtaLoading(false);
-    }
-  // navigate escluso intenzionalmente: cambia ad ogni screen change ma è stabile per azione
-  }, [hasEnough, credits, unlimitedActive, ctaLoading, ONLINE_COST]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const av    = CONFIG.AVATARS?.find(a => a.id === player?.avatarId) || { emoji: '👤' };
-  const { pct: xpPct } = getXpProgress(player?.xp || 0, player?.level || 1);
-  const crPct = unlimitedActive ? 1 : Math.min(1, (credits || 0) / CMAX);
-
-  const objAccent = nextObj?.type === 'bonus'     ? '#ffd700'
-                  : nextObj?.type === 'challenge'  ? '#4caf50'
-                  : th.accent;
-  const objBg     = nextObj?.type === 'bonus'     ? 'rgba(255,215,0,0.1)'
-                  : nextObj?.type === 'challenge'  ? 'rgba(76,175,80,0.1)'
-                  : th.bgCard;
-  const objIcon   = nextObj?.type === 'bonus'     ? '🎁'
-                  : nextObj?.type === 'challenge'  ? '🎯'
-                  : '🎯';
-  const objTitle  = nextObj?.type === 'bonus'     ? 'Bonus Giornaliero'
-                  : nextObj?.type === 'challenge'  ? `Daily Challenge — ${nextObj.variant?.name || ''}`
-                  : getMissionText(nextObj?.mission);
-  // Reward reale del prossimo claim: BASE + STREAK_REWARDS[streakInfo.streak]
-  // claimDailyBonus fa newStreak = streak+1 → streakIdx = streak → STREAK_REWARDS[streak]
-  const STREAK_REWARDS_LOCAL = [5, 8, 12, 15, 20, 25, 35];
-  const streakBonusNext = STREAK_REWARDS_LOCAL[Math.min(streakInfo.streak, STREAK_REWARDS_LOCAL.length - 1)] || 5;
-  const totalBonusNext  = (CONFIG.CREDITS_DAILY_BONUS || 12) + streakBonusNext;
-  const objReward = nextObj?.type === 'bonus'
-    ? `+${totalBonusNext} 💰 (${CONFIG.CREDITS_DAILY_BONUS || 12} base + ${streakBonusNext} streak)`
-    : nextObj?.type === 'challenge'
-    ? `+${CONFIG.DAILY_PASS_REWARD_CREDITS || 50}💰  +${CONFIG.DAILY_PASS_REWARD_XP || 100}XP`
-    : `+${nextObj?.mission?.reward?.credits || 0}💰  +${nextObj?.mission?.reward?.xp || 0}XP`;
+  const pct      = Math.max(0, seconds / totalSeconds);
+  const barColor = isDanger ? '#e94560' : seconds <= totalSeconds * 0.4 ? '#f5a623' : '#4caf50';
 
   return (
-    <ScrollView style={[s.root, { backgroundColor: th.bg }]} contentContainerStyle={s.content}>
-
-      {/* 1 ── HEADER */}
-      <View style={s.header}>
-        <View>
-          <Text style={[s.appName, { color: th.textPrimary }]}>{CONFIG.APP_NAME}</Text>
-          <Text style={[s.appSub,  { color: th.accent }]}>ULTIMATE</Text>
-        </View>
-        <TouchableOpacity
-          style={[s.profileBtn, { backgroundColor: th.bgCard, borderColor: th.border }]}
-          onPress={() => navigate('profile')}>
-          <Text style={{ fontSize: 24 }}>{player?.facePhotoUri ? '📸' : av.emoji}</Text>
-          <View style={[s.lvBadge, { backgroundColor: th.accent }]}>
-            <Text style={s.lvBadgeTxt}>{player?.level || 1}</Text>
-          </View>
-        </TouchableOpacity>
+    <View style={tb.root}>
+      <View style={[tb.bg, { backgroundColor: th.border }]}>
+        <Animated.View style={[tb.fill, {
+          width: `${pct * 100}%`,
+          backgroundColor: barColor,
+          opacity: blinkAnim,
+        }]} />
       </View>
-
-      {/* 2 ── HERO PLAYER CARD */}
-      <View style={[s.hero, { backgroundColor: th.bgCard, borderColor: hasEnough ? th.border : th.danger }]}>
-        <View style={s.heroTop}>
-          <View style={{ flex: 1 }}>
-            <Text style={[s.heroName, { color: th.textPrimary }]} numberOfLines={1}>
-              {player?.name || 'Ospite'}
-            </Text>
-            <View style={s.heroMeta}>
-              <Text style={[s.heroLv, { color: th.accent }]}>Lv.{player?.level || 1}</Text>
-              {player?.eloOnline > 0 && (
-                <Text style={[s.heroElo, { color: th.textMuted }]}>· ELO {player.eloOnline} 🌐</Text>
-              )}
-              {seasonLeft > 0 && (
-                <Text style={[s.heroSeason, { color: seasonLeft <= 7 ? th.danger : th.accent }]}>
-                  · 🏆 {seasonLeft}d
-                </Text>
-              )}
-            </View>
-            <View style={[s.xpBg, { backgroundColor: th.border }]}>
-              <View style={[s.xpFill, {
-                width: `${Math.round(xpPct * 100)}%`,
-                backgroundColor: th.info || '#00bfff',
-              }]} />
-            </View>
-          </View>
-
-          <View style={s.heroRight}>
-            <Text style={[s.heroCr, { color: hasEnough ? th.accent : th.danger }]}>
-              {unlimitedActive ? '∞' : (credits || 0)}
-            </Text>
-            <Text style={[s.heroCrLabel, { color: th.textMuted }]}>💰</Text>
-            {!hasEnough && !unlimitedActive && (
-              <Text style={[s.heroTimer, { color: '#ff9f43' }]}>
-                ⏱ {minToPlay <= 1 ? '<1 min' : `${minToPlay} min`}
-              </Text>
-            )}
-            <Text style={[s.heroIngot, { color: th.textMuted }]}>🪙 {ingots}</Text>
-          </View>
-        </View>
-
-        <View style={[s.crBarBg, { backgroundColor: th.border }]}>
-          <View style={[s.crBarFill, {
-            width: `${crPct * 100}%`,
-            backgroundColor: crPct > 0.6 ? '#4caf50' : crPct > 0.25 ? '#f5a623' : th.danger,
-          }]} />
-        </View>
-        <Text style={[s.crBarLabel, { color: th.textHint || th.textMuted }]}>
-          {unlimitedActive ? '∞' : `${credits || 0} / ${CMAX} cr — +1 ogni ${CONFIG.CREDITS_REGEN_MINUTES||8} min`}
-        </Text>
-      </View>
-
-      {/* 2.5 ── STREAK CARD */}
-      <StreakCard
-        streak={streakInfo.streak}
-        bestStreak={streakInfo.bestStreak}
-        claimedToday={streakInfo.claimedToday}
-        bonusDoubledToday={streakInfo.bonusDoubledToday}
-        lastStreakDate={streakInfo.lastStreakDate}
-        onClaim={handleStreakClaim}
-        onAfterDouble={handleStreakDouble}
-      />
-
-      {/* 2.6 ── COMEBACK BONUS BANNER */}
-      {comebackBonus && comebackBonus.bonusLevel > 0 && (
-        <TouchableOpacity
-          style={[s.comebackBanner, { backgroundColor: th.bgCard, borderColor: '#00FF88' }]}
-          onPress={handleComebackClaim}
-          activeOpacity={0.85}>
-          <Text style={{ fontSize: 26, marginRight: 12 }}>
-            {comebackBonus.bonusLevel === 3 ? '🏆' : comebackBonus.bonusLevel === 2 ? '🎁' : '🎉'}
-          </Text>
-          <View style={{ flex: 1 }}>
-            <Text style={[s.comebackTitle, { color: '#00FF88' }]}>
-              {comebackBonus.bonusLevel === 3
-                ? 'Bentornato campione! 🏆'
-                : comebackBonus.bonusLevel === 2
-                ? 'Bentornato!'
-                : 'Ci sei mancato! 🎉'}
-            </Text>
-            <Text style={[s.comebackSub, { color: th.textMuted }]}>
-              Tocca per riscuotere il bonus di ritorno
-            </Text>
-          </View>
-          <Text style={[s.comebackArrow, { color: '#00FF88' }]}>→</Text>
-        </TouchableOpacity>
-      )}
-
-      {/* 3 ── CTA PRINCIPALE: GIOCA (→ selezione variante) + shortcut Gioca Subito */}
-      {/* Pulsante principale: va a PlayScreen per scegliere variante e modalità */}
-      <TouchableOpacity
-        style={[s.ctaPlay, { backgroundColor: th.accent }]}
-        onPress={() => navigate('play')}
-        activeOpacity={0.85}>
-        <Text style={s.ctaPlayIcon}>🎮</Text>
-        <View style={{ flex: 1 }}>
-          <Text style={s.ctaPlayTitle}>Gioca</Text>
-          <Text style={s.ctaPlaySub}>Scegli variante e modalità</Text>
-        </View>
-        <Text style={s.ctaArrow}>→</Text>
-      </TouchableOpacity>
-
-      {/* Shortcut Ranked rapido */}
-      <TouchableOpacity
-        style={[s.cta, { backgroundColor: ctaLoading ? th.border : th.danger }]}
-        onPress={handleCTA}
-        disabled={ctaLoading}
-        activeOpacity={0.85}>
-        <Text style={s.ctaIcon}>{ctaLoading ? '⏳' : hasEnough ? '⚡' : '📺'}</Text>
-        <View style={{ flex: 1 }}>
-          <Text style={s.ctaTitle}>
-            {ctaLoading ? 'Caricamento…' : hasEnough ? 'Gioca subito' : 'Guarda un video e gioca'}
-          </Text>
-          <Text style={s.ctaSub}>
-            {ctaLoading ? '' : hasEnough
-              ? `Online (Beta) · ${ONLINE_COST} cr — Scala la classifica`
-              : (() => {
-                  const missing = Math.max(0, ONLINE_COST - (credits || 0));
-                  // CREDITS_VIDEO_REWARD = 5cr ≥ ONLINE_COST = 4cr → garantisce accesso
-                  return missing <= 1
-                    ? `Ti manca solo ${missing} credito · 1 video e giochi subito`
-                    : missing <= (CONFIG.CREDITS_VIDEO_REWARD || 5)
-                    ? `📺 Guarda 1 video → +5 cr → gioca subito`
-                    : `📺 Guarda 1 video → +5 cr · mancano ancora ${missing - (CONFIG.CREDITS_VIDEO_REWARD || 5)} cr`;
-                })()}
-          </Text>
-        </View>
-        {!ctaLoading && <Text style={s.ctaArrow}>→</Text>}
-      </TouchableOpacity>
-
-      {/* 4 ── PROSSIMO OBIETTIVO (una sola card) */}
-      {nextObj && (
-        <TouchableOpacity
-          style={[s.obj, { backgroundColor: objBg, borderColor: objAccent }]}
-          onPress={async () => {
-            if (nextObj.type === 'bonus') {
-              await handleStreakClaim(); // centralizzato — stesso flusso della StreakCard
-            } else if (nextObj.type === 'challenge') {
-              navigate('dailyChallenge');
-            } else {
-              navigate('missions');
-            }
-          }}
-          activeOpacity={0.85}>
-          <Text style={{ fontSize: 20, marginRight: 12 }}>{objIcon}</Text>
-          <View style={{ flex: 1 }}>
-            <Text style={[s.objTitle, { color: objAccent }]} numberOfLines={1}>{objTitle}</Text>
-            {nextObj.type === 'mission' && nextObj.mission && (
-              <View style={[s.objBarBg, { backgroundColor: th.border }]}>
-                <View style={[s.objBarFill, {
-                  width: `${Math.round(Math.min(1, (nextObj.mission.progress || 0) / (nextObj.mission.target || 1)) * 100)}%`,
-                  backgroundColor: objAccent,
-                }]} />
-              </View>
-            )}
-            <Text style={[s.objReward, { color: th.textMuted }]}>{objReward}</Text>
-          </View>
-          <Text style={{ color: objAccent, fontSize: 16, marginLeft: 8 }}>→</Text>
-        </TouchableOpacity>
-      )}
-
-      {/* 5 ── CHAOS WEEK (compatto) */}
-      {chaosRule && (
-        <TouchableOpacity
-          style={[s.chaos, { backgroundColor: 'rgba(233,69,96,0.08)', borderColor: th.danger }]}
-          onPress={() => navigate('play')}>
-          <Text style={{ fontSize: 15, marginRight: 8 }}>{chaosRule.icon}</Text>
-          <Text style={[s.chaosLabel, { color: th.danger, flex: 1 }]}>⚡ CHAOS: {chaosRule.label}</Text>
-          <Text style={{ color: th.danger }}>→</Text>
-        </TouchableOpacity>
-      )}
-
-      {/* 6 ── QUICK PLAY AI */}
-      <TouchableOpacity
-        style={[s.qpAI, { backgroundColor: th.bgCard, borderColor: th.border }]}
-        onPress={() => navigate('quickPlayAI')}
-        activeOpacity={0.85}>
-        <Text style={{ fontSize: 17, marginRight: 10 }}>🤖</Text>
-        <Text style={[s.qpAITxt, { color: th.textSecondary, flex: 1 }]}>
-          {t('quickPlayAI')} — {t('free') || 'Gratis'} · ×0.2 ELO
-        </Text>
-        <Text style={{ color: th.textMuted, fontSize: 13 }}>→</Text>
-      </TouchableOpacity>
-
-      {/* 6b ── RANDOM SHORTCUT */}
-      <TouchableOpacity
-        style={[s.qpAI, { backgroundColor: th.bgCard, borderColor: th.border }]}
-        onPress={() => navigate('game', {
-          variantId: 'random', mode: 'ai', aiLevel: 'medium',
-          p1Name: player?.name || 'Tu', p2Name: 'AI',
-          pieceP1: 'X', pieceP2: 'O',
-        })}
-        activeOpacity={0.85}>
-        <Text style={{ fontSize: 17, marginRight: 10 }}>🎲</Text>
-        <Text style={[s.qpAITxt, { color: th.textSecondary, flex: 1 }]}>
-          Random — Variante a sorpresa · ×1.5 XP
-        </Text>
-        <Text style={{ color: th.textMuted, fontSize: 13 }}>→</Text>
-      </TouchableOpacity>
-
-      {/* 7 ── MENU PRINCIPALE */}
-      {[
-        { label: t('missions'),    icon: '🎯', screen: 'missions',    color: '#ff9f43', badge: hasMissionBadge },
-        { label: t('leaderboard'), icon: '🏆', screen: 'leaderboard', color: th.accent },
-        { label: t('shop'),        icon: '🏪', screen: 'shop',        color: '#ffd700' },
-      ].map(item => (
-        <TouchableOpacity
-          key={item.screen}
-          style={[s.menuItem, { backgroundColor: th.bgCard, borderColor: th.border, borderLeftColor: item.color }]}
-          onPress={() => { logNav('Home', item.screen); navigate(item.screen); }}
-          activeOpacity={0.75}>
-          <View style={{ position: 'relative', marginRight: 14 }}>
-            <Text style={s.menuIcon}>{item.icon}</Text>
-            {item.badge && (
-              <View style={[s.menuBadge, {
-                backgroundColor: '#e94560',
-                minWidth: completedCount > 1 ? 18 : 10,
-                borderRadius: 9,
-                paddingHorizontal: completedCount > 1 ? 3 : 0,
-              }]}>
-                {completedCount > 1 && (
-                  <Text style={{ color: '#fff', fontSize: 9, fontWeight: '900' }}>{completedCount}</Text>
-                )}
-              </View>
-            )}
-          </View>
-          <Text style={[s.menuLabel, { color: th.textPrimary }]}>{item.label}</Text>
-          <Text style={[s.menuArrow, { color: item.color }]}>→</Text>
-        </TouchableOpacity>
-      ))}
-
-      {/* 8 ── MENU SECONDARIO */}
-      <View style={s.menuSec}>
-        {[
-          { label: t('stats'),    icon: '📊', screen: 'stats',    color: th.info || '#00bfff' },
-          { label: 'Clan',        icon: '⚔️', screen: 'clan',    color: '#ff7043' },
-          { label: t('settings'), icon: '⚙️', screen: 'settings', color: '#808098' },
-        ].map(item => (
-          <TouchableOpacity
-            key={item.screen}
-            style={[s.menuSecItem, { backgroundColor: th.bgCard, borderColor: th.border }]}
-            onPress={() => { logNav('Home', item.screen); navigate(item.screen); }}
-            activeOpacity={0.75}>
-            <Text style={{ fontSize: 16, marginRight: 10 }}>{item.icon}</Text>
-            <Text style={[s.menuSecLabel, { color: th.textSecondary, flex: 1 }]}>{item.label}</Text>
-            <Text style={{ color: th.textMuted, fontSize: 13 }}>→</Text>
-          </TouchableOpacity>
-        ))}
-      </View>
-
-      <Text style={[s.version, { color: th.textHint || th.textMuted }]}>v{CONFIG.APP_VERSION}</Text>
-    </ScrollView>
+      <Text style={[tb.sec, { color: isDanger ? '#e94560' : th.textMuted }]}>
+        {seconds}s
+      </Text>
+    </View>
   );
 }
 
-const s = StyleSheet.create({
-  root:         { flex: 1 },
-  content:      { padding: 16, paddingBottom: 50 },
-  // Header
-  header:       { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 10, marginBottom: 4 },
-  appName:      { fontSize: 22, fontWeight: '900', letterSpacing: 1 },
-  appSub:       { fontSize: 11, fontWeight: '900', letterSpacing: 4, marginTop: 1 },
-  profileBtn:   { width: 48, height: 48, borderRadius: 24, borderWidth: 2, justifyContent: 'center', alignItems: 'center' },
-  lvBadge:      { position: 'absolute', bottom: -4, right: -4, borderRadius: 9, minWidth: 18, height: 18, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 3 },
-  lvBadgeTxt:   { color: '#000', fontWeight: '900', fontSize: 10 },
-  // Hero card
-  hero:         { borderRadius: 16, padding: 16, marginBottom: 10, borderWidth: 1 },
-  heroTop:      { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 10 },
-  heroName:     { fontSize: 19, fontWeight: '900', marginBottom: 3 },
-  heroMeta:     { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 6 },
-  heroLv:       { fontSize: 13, fontWeight: '800' },
-  heroElo:      { fontSize: 12 },
-  heroSeason:   { fontSize: 12, fontWeight: '700' },
-  xpBg:         { height: 5, borderRadius: 3, overflow: 'hidden' },
-  xpFill:       { height: 5, borderRadius: 3 },
-  heroRight:    { alignItems: 'flex-end', marginLeft: 14, minWidth: 58 },
-  heroCr:       { fontSize: 30, fontWeight: '900', lineHeight: 34 },
-  heroCrLabel:  { fontSize: 14, marginTop: -2 },
-  heroTimer:    { fontSize: 10, marginTop: 3 },
-  heroIngot:    { fontSize: 12, marginTop: 5 },
-  crBarBg:      { height: 7, borderRadius: 4, overflow: 'hidden', marginBottom: 5 },
-  crBarFill:    { height: 7, borderRadius: 4 },
-  crBarLabel:   { fontSize: 10 },
-  // CTA principale
-  ctaPlay:      { flexDirection: 'row', alignItems: 'center', borderRadius: 18, padding: 18, marginBottom: 8, elevation: 4 },
-  ctaPlayIcon:  { fontSize: 26, marginRight: 14 },
-  ctaPlayTitle: { fontSize: 20, fontWeight: '900', color: '#fff' },
-  ctaPlaySub:   { fontSize: 11, color: 'rgba(255,255,255,0.82)', marginTop: 2 },
-  cta:          { flexDirection: 'row', alignItems: 'center', borderRadius: 18, padding: 18, marginBottom: 10, elevation: 3 },
-  ctaIcon:      { fontSize: 28, marginRight: 14 },
-  ctaTitle:     { fontSize: 19, fontWeight: '900', color: '#fff' },
-  ctaSub:       { fontSize: 11, color: 'rgba(255,255,255,0.85)', marginTop: 2 },
-  ctaArrow:     { fontSize: 22, color: '#fff', marginLeft: 8 },
-  // Prossimo obiettivo
-  obj:          { flexDirection: 'row', alignItems: 'center', borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1.5 },
-  objTitle:     { fontSize: 14, fontWeight: '900', marginBottom: 5 },
-  objBarBg:     { height: 5, borderRadius: 3, overflow: 'hidden', marginBottom: 5 },
-  objBarFill:   { height: 5, borderRadius: 3 },
-  objReward:    { fontSize: 12 },
-  // Chaos (compatto)
-  chaos:        { flexDirection: 'row', alignItems: 'center', borderRadius: 10, padding: 9, marginBottom: 8, borderWidth: 1 },
-  chaosLabel:   { fontSize: 12, fontWeight: '800' },
-  // Quick Play AI
-  qpAI:         { flexDirection: 'row', alignItems: 'center', borderRadius: 12, padding: 10, marginBottom: 12, borderWidth: 1 },
-  qpAITxt:      { fontSize: 13, fontWeight: '600' },
-  // Menu principale
-  menuItem:     { flexDirection: 'row', alignItems: 'center', borderRadius: 14, paddingHorizontal: 16, paddingVertical: 15, marginBottom: 7, borderLeftWidth: 4, borderWidth: 1 },
-  menuIcon:     { fontSize: 20, marginRight: 14 },
-  menuLabel:    { flex: 1, fontSize: 15, fontWeight: '700' },
-  menuArrow:    { fontSize: 15 },
-  menuBadge:    { position: 'absolute', top: -2, right: -2, width: 10, height: 10, borderRadius: 5, alignItems: 'center', justifyContent: 'center' },
-  // Menu secondario
-  menuSec:      { gap: 6, marginBottom: 10 },
-  menuSecItem:  { flexDirection: 'row', alignItems: 'center', borderRadius: 12, paddingHorizontal: 14, paddingVertical: 11, borderWidth: 1 },
-  menuSecLabel: { fontSize: 13, fontWeight: '600' },
-  version:      { textAlign: 'center', fontSize: 11, marginTop: 14 },
+const tb = StyleSheet.create({
+  root:  { flexDirection:'row', alignItems:'center', paddingHorizontal:16, paddingVertical:4, gap:10 },
+  bg:    { flex:1, height:7, borderRadius:4, overflow:'hidden' },
+  fill:  { height:7, borderRadius:4 },
+  sec:   { fontSize:13, fontWeight:'700', width:30, textAlign:'right' },
+});
+
+// ── Pannello info variante (10 secondi) ──────────────────
+function RandomInfoPanel({ chosenVariant, onSkip, th }) {
+  const [sec, setSec] = useState(CONFIG.RANDOM_PANEL_SECONDS);
+  const v = Object.values(CONFIG.GAME_VARIANTS).find(x => x.id === chosenVariant);
+  useEffect(() => {
+    if (sec <= 0) { onSkip(); return; }
+    const t = setTimeout(() => setSec(s => s-1), 1000);
+    return () => clearTimeout(t);
+  }, [sec, onSkip]);
+  if (!v) return null;
+  return (
+    <View style={[rp.root, { backgroundColor: th.bg }]}>
+      <View style={[rp.card, { backgroundColor: th.bgCard, borderColor: th.accent }]}>
+        <Text style={[rp.title, { color: th.accent }]}>🎲 Random!</Text>
+        <View style={rp.iconBox}>
+          <VariantIcon variantId={chosenVariant} color={th.accent} size={64} />
+        </View>
+        <Text style={[rp.name, { color: th.textPrimary }]}>{v.name}</Text>
+        {v.boardSize && (
+          <Text style={[rp.grid, { color: th.textMuted }]}>
+            {v.boardSize}×{v.boardSize} · Win {v.winLength} in a row
+          </Text>
+        )}
+        <View style={rp.rules}>
+          {(v.rules || []).slice(0,3).map((r,i) => (
+            <Text key={i} style={[rp.rule, { color: th.textSecondary }]}>• {r}</Text>
+          ))}
+        </View>
+        <View style={rp.bottom}>
+          <Text style={[rp.timer, { color: th.textMuted }]}>Starting in {sec}s…</Text>
+          <TouchableOpacity style={[rp.skipBtn, { backgroundColor: th.accent }]} onPress={onSkip}>
+            <Text style={rp.skipTxt}>{t('skip')} →</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+
+// ── MAIN GAME SCREEN ─────────────────────────────────────
+export default function GameScreen() {
+  const { navigate, screenParams, refreshCredits, credits, trySpendCredits } = useContext(AppContext);
+  const lang = useLang();
+  const th   = getTheme();
+  const {
+    variantId, mode, aiLevel, p1Name, p2Name, pieceP1, pieceP2,
+    leg = 1, leg1Result = null,   // doppia partita
+  } = screenParams;
+
+  const [gameState,     setGameState]     = useState(null);
+  const [thinking,      setThinking]      = useState(false);
+  const [paused,        setPaused]        = useState(false);
+  const [showQuit,      setShowQuit]      = useState(false);
+  const [showRematch,   setShowRematch]   = useState(false);
+  const [showAd,        setShowAd]        = useState(false);
+  const [showNoCredits, setShowNoCredits] = useState(false);
+  const [adWatchLoading, setAdWatchLoading] = useState(false);
+  const [wildPending,   setWildPending]   = useState(null);
+  const [chosenVariant, setChosenVariant] = useState(null);
+  const [showInfoPanel, setShowInfoPanel] = useState(false);
+  // pendingState rimosso: mai usato — era residuo di una feature incompleta
+  const [randomFirst,   setRandomFirst]   = useState('X');
+
+  // ── Timer online ─────────────────────────────────────────
+  const [turnSec,     setTurnSec]     = useState(TURN_SEC);
+  const [timerActive, setTimerActive] = useState(false);
+  // conta timeout consecutivi per giocatore: { X: 0, O: 0 }
+  const timeoutCount  = useRef({ X:0, O:0 });
+  const timerIntervalRef = useRef(null);
+
+  const winAnim          = useRef(new Animated.Value(0)).current;
+  const aiTimer          = useRef(null);
+  const gameStartRef     = useRef(Date.now()); // anti-farming: durata partita
+  const lastRematchRef   = useRef(0);           // guard: previeni spam rematch
+  const _navigatingRef   = useRef(false);        // guard: previeni doppia navigazione
+  const appStateRef      = useRef(AppState.currentState);
+  const leftAtRef        = useRef(null);
+  const savedStateRef    = useRef(null);
+  const _pendingResultRef = useRef(null);
+  // handleGameOverRef / onTimerExpiredRef: ref pattern — nessuna stale closure
+  const handleGameOverRef   = useRef(null);
+  const onTimerExpiredRef   = useRef(null); // aggiornato dopo ogni render
+
+  const variant     = Object.values(CONFIG.GAME_VARIANTS).find(v => v.id === variantId);
+  // getMatchCost: costo effettivo per modalità e difficoltà
+  // local=0, AI easy=0, AI medium=1, AI hard=2, online=variant.onlineCost
+  const getMatchCost = () => {
+    if (mode === 'local') return 0;
+    if (mode === 'ai') {
+      if (aiLevel === 'easy')   return 0;
+      if (aiLevel === 'medium') return 1;
+      if (aiLevel === 'hard')   return 2;
+      return 1;
+    }
+    if (mode === 'online') {
+      const base = variant?.onlineCost ?? 4;
+      // Prime FREE_ONLINE_GAMES partite online gratis
+      const freeGames = CONFIG.CREDITS_FREE_ONLINE_GAMES || 5;
+      const onlineTotal = (() => {
+        try { const s = getStore(); return s?.stats?.total?.onlineGames || 0; } catch(e) { return 0; /* store not loaded yet */ }
+      })();
+      return onlineTotal < freeGames ? 0 : base;
+    }
+    return variant?.creditCost ?? 0;
+  };
+  const cost        = getMatchCost();
+  const rematchCost = variant?.rematchCost ?? Math.ceil(cost/2);
+  const isOnline    = mode === 'online';
+
+  const pieceX = pieceP1 || 'X';
+  const pieceO = pieceP2 || 'O';
+  const showP  = (p) => p === 'PHOTO' ? '📸' : (p || '?');
+
+  const clearTurnTimer = useCallback(() => {
+    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+    timerIntervalRef.current = null;
+    setTimerActive(false);
+  }, []); // refs + stable setters only — no deps needed
+
+  const resetTurnTimer = () => {
+    clearTurnTimer();
+    setTurnSec(TURN_SEC);
+    setTimerActive(true);
+    timerIntervalRef.current = setInterval(() => {
+      setTurnSec(prev => {
+        if (prev <= 1) {
+          clearInterval(timerIntervalRef.current);
+          timerIntervalRef.current = null;
+          setTimerActive(false);
+          onTimerExpiredRef.current?.();
+          return TURN_SEC;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  // Quando un giocatore fa una mossa volontariamente, resetta il suo counter timeout
+  const onPlayerMoved = (player) => {
+    timeoutCount.current[player] = 0;
+  };
+
+  const startNewGame = useCallback(() => {
+    timeoutCount.current = { X:0, O:0 };
+    gameStartRef.current = Date.now();
+    _navigatingRef.current = false; // reset guard
+    const first = randomFirstPlayer();
+
+    if (variantId === 'random') {
+      setRandomFirst(first);
+      setShowInfoPanel(true);
+    } else if (variantId === 'ultimate') {
+      const s = createUltimateState(first);
+      validateGameState(s, 'init');
+      setGameState(s);
+    } else {
+      const s = createClassicState(variantId, first);
+      if (!s) { logError('init','null state'); navigate('home'); return; }
+      validateGameState(s, 'init');
+      setGameState(s);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [variantId, navigate]); // refs e setters sono stabili, variantId è la dep reale
+
+  // ── AppState ──────────────────────────────────────────────
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', async (next) => {
+      if (appStateRef.current==='active' && next!=='active') {
+        leftAtRef.current = Date.now();
+        if (mode==='ai' && gameState && !gameState.gameOver) {
+          savedStateRef.current = gameState;
+          setPaused(true);
+          if (aiTimer.current) clearTimeout(aiTimer.current);
+        }
+        // Pausa timer online: ferma il setInterval, non solo il flag
+        clearTurnTimer();
+      }
+      if (appStateRef.current!=='active' && next==='active') {
+        const elapsed = leftAtRef.current ? (Date.now()-leftAtRef.current)/1000 : 0;
+        if (elapsed > 30 && mode==='ai' && savedStateRef.current && !savedStateRef.current.gameOver) {
+          const ls = { ...savedStateRef.current, winner:'O', gameOver:true };
+          savedStateRef.current = null;
+          setGameState(ls);
+          await handleGameOverRef.current?.(ls, true);
+        } else {
+          savedStateRef.current = null;
+          setPaused(false);
+        }
+        leftAtRef.current = null;
+      }
+      appStateRef.current = next;
+    });
+    return () => sub?.remove?.();
+  }, [gameState, mode]);
+
+  // ── Init ──────────────────────────────────────────────────
+  useEffect(() => {
+    logGame('init', `v=${variantId} mode=${mode} leg=${leg}`);
+    startNewGame();
+    return () => {
+      if (aiTimer.current) clearTimeout(aiTimer.current);
+      clearTurnTimer();
+    };
+  }, [variantId, startNewGame, clearTurnTimer]); // mode/leg solo per log — stable per lifetime
+
+  // ── Timer online: avvia/ferma al cambio di turno ─────────
+  useEffect(() => {
+    if (!isOnline || !gameState || gameState.gameOver || paused) {
+      clearTurnTimer();
+      return;
+    }
+    // Avvia timer per turno umano (X = il giocatore locale)
+    // In online entrambi hanno il timer, ma qui gestiamo solo il lato locale
+    resetTurnTimer();
+  }, [gameState?.moveCount, gameState?.currentPlayer, paused, isOnline]);
+
+  // Timer scaduto — AI easy fa la mossa, secondo timeout = sconfitta
+  const onTimerExpired = useCallback(() => {
+    if (!gameState || gameState.gameOver) return;
+
+    const currentP = gameState.currentPlayer;
+    const newCount = (timeoutCount.current[currentP] || 0) + 1;
+    timeoutCount.current[currentP] = newCount;
+
+    logGame('timer', `timeout p=${currentP} count=${newCount}`);
+
+    if (newCount >= (CONFIG.TIMER_CONSECUTIVE_MAX || 2)) {
+      // 2° timeout: sconfitta
+      const loser   = currentP;
+      const winner  = loser === 'X' ? 'O' : 'X';
+      const forfeit = { ...gameState, winner, gameOver:true };
+      setGameState(forfeit);
+      handleGameOverRef.current?.(forfeit, true);
+      return;
+    }
+
+    // 1° timeout:
+    // - AI mode → AI easy fa la mossa per il giocatore
+    // - Online mode → sconfitta diretta (no AI fallback in multiplayer reale)
+    if (isOnline) {
+      // In online: 1° timeout = sconfitta immediata (comportamento equo)
+      const loserOnline  = currentP;
+      const winnerOnline = loserOnline === 'X' ? 'O' : 'X';
+      const forfeitOnline = { ...gameState, winner: winnerOnline, gameOver: true };
+      setGameState(forfeitOnline);
+      handleGameOverRef.current?.(forfeitOnline, true);
+      return;
+    }
+    try {
+      const v  = gameState.chosenVariant || gameState.variant;
+      const mv = getAIMove(gameState, 'easy');
+      if (mv === null || mv === undefined) return;
+
+      let ns;
+      if (v === 'ultimate')                     ns = makeMoveUltimate(gameState, mv.boardIndex, mv.cellIndex);
+      else if (v==='wild' || v==='order_chaos') ns = makeMoveClassic(gameState, mv.cellIndex, mv.piece || 'X');
+      else                                      ns = makeMoveClassic(gameState, mv);
+
+      if (ns) {
+        validateGameState(ns, 'timer.ai');
+        setGameState(ns);
+        if (ns.gameOver) handleGameOverRef.current?.(ns);
+      }
+    } catch(e) { logError('timer', e.message); }
+  }, [gameState, isOnline]); // handleGameOver chiamato tramite ref — no stale closure
+  onTimerExpiredRef.current = onTimerExpired; // aggiornato ad ogni render
+
+  // ── Ruota completata ──────────────────────────────────────
+  const onWheelDone = useCallback((selectedVariant) => {
+    setShowInfoPanel(false);
+    const actualId = selectedVariant?.id || 'classic';
+    setChosenVariant(actualId);
+    let s;
+    if (actualId === 'ultimate') s = createUltimateState(randomFirst);
+    else {
+      s = createClassicState(actualId, randomFirst);
+      if (!s) s = createRandomState(randomFirst);
+    }
+    if (s) { validateGameState(s, 'random.wheel'); setGameState(s); }
+    else navigate('home');
+  }, [randomFirst, navigate]);
+
+  // ── AI turno ──────────────────────────────────────────────
+  useEffect(() => {
+    if (!gameState || gameState.gameOver || mode!=='ai' || paused || thinking) return;
+    if (gameState.currentPlayer !== 'O') return;
+    setThinking(true);
+    const delay = getThinkingDelay(aiLevel);
+    aiTimer.current = setTimeout(() => {
+      try {
+        const mv = getAIMove(gameState, aiLevel);
+        if (mv===null||mv===undefined) { setThinking(false); return; }
+        const v = gameState.chosenVariant || gameState.variant;
+        let ns;
+        if (v==='ultimate')                     ns = makeMoveUltimate(gameState, mv.boardIndex, mv.cellIndex);
+        else if (v==='wild' || v==='order_chaos') ns = makeMoveClassic(gameState, mv.cellIndex, mv.piece);
+        else                                      ns = makeMoveClassic(gameState, mv);
+        validateGameState(ns, 'AI');
+        setGameState(ns);
+        if (ns.gameOver) handleGameOverRef.current?.(ns);
+      } catch(e) { logError('AI', e.message); }
+      setThinking(false);
+    }, delay);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameState?.moveCount, gameState?.currentPlayer, paused]); // handleGameOver via ref
+
+  // ── Mossa umana ───────────────────────────────────────────
+  const onCell = useCallback((boardIdx, cellIdx) => {
+    if (!gameState || gameState.gameOver || thinking || paused) return;
+    if (mode==='ai' && gameState.currentPlayer==='O') return;
+    const v = gameState.chosenVariant || gameState.variant;
+    const player = gameState.currentPlayer;
+
+    // Resetta timeout counter del giocatore che ha mosso
+    onPlayerMoved(player);
+
+    if (v==='wild' || v==='order_chaos') {
+      setWildPending({ boardIdx, cellIdx, isOC: v==='order_chaos', player });
+      return;
+    }
+    if (v==='ultimate') {
+      const ns = makeMoveUltimate(gameState, boardIdx, cellIdx);
+      validateGameState(ns, 'human.ult');
+      setGameState(ns);
+      if (ns.gameOver) handleGameOverRef.current?.(ns);
+    } else {
+      const ns = makeMoveClassic(gameState, cellIdx);
+      validateGameState(ns, 'human.classic');
+      setGameState(ns);
+      if (ns.gameOver) handleGameOverRef.current?.(ns);
+    }
+  }, [gameState, mode, thinking, paused]);
+
+  // ── Fine partita ──────────────────────────────────────────
+  const handleGameOver = async (st, forfeit=false) => {
+    clearTurnTimer();
+    logGame('gameOver', `winner=${st.winner} draw=${st.isDraw} forfeit=${forfeit}`);
+    Vibration.vibrate(st.isDraw ? 80 : 300);
+
+    const v = st.chosenVariant || st.variant;
+
+    if (mode==='local') {
+      recordLocalResult(v, st.winner, st.currentPlayer);
+      await incrementGamesSession();
+      const showAdNow = !forfeit && await adsCheckShouldShow();
+      setTimeout(async () => {
+        if (aiTimer.current) clearTimeout(aiTimer.current);
+        const params = {
+          result: st.isDraw ? 'draw' : st.winner==='X' ? 'win' : 'loss',
+          winnerPiece: st.winner, variantId: v, mode,
+          creditsEarned: 0, xpEarned: 0, rematchCost: 0,
+          difficulty: aiLevel || 'easy',
+          onRematch: () => navigate('game', { variantId: v, mode, aiLevel, p1Name, p2Name, pieceP1, pieceP2 }),
+          onMenu:    goToMenu,
+        };
+        if (_navigatingRef.current) return; _navigatingRef.current = true;
+      if (!showAdNow) { navigate('gameResult', params); return; }
+        const adShown = await showInterstitial();
+        if (!adShown) { navigate('gameResult', params); return; }
+        // adInFlight=true → SDK non disponibile → placeholder Modal
+        // adInFlight=false → SDK ha mostrato la vera ad e ha già terminato
+        const { adInFlight } = getAdsState();
+        if (adInFlight) {
+          setShowAd(true);
+          _pendingResultRef.current = params;
+        } else {
+          await recordAdShown();
+          navigate('gameResult', params);
+        }
+      }, 900);
+      return;
+    }
+
+    // Il giocatore locale è sempre X (impostato da ModeSelect/OnlineScreen).
+    // st.winner==='X' → il locale ha vinto; st.winner==='O' → il locale ha perso.
+    // Vale sia per AI che per online — il ramo online non era 'win' fisso: era un bug.
+    const result = forfeit ? 'loss'
+      : st.isDraw ? 'draw'
+      : (st.winner === 'X' ? 'win' : 'loss');
+
+    const gameDurationSec = (Date.now() - gameStartRef.current) / 1000;
+    const moveCount = gameState?.moveCount || 0;
+    // Pass moveCount for future anti-farming expansion
+    const statsResult = await updateStats(v, mode, result, aiLevel, gameDurationSec, moveCount);
+    await incrementGamesSession(); // conta per le ad ogni 2 partite
+    // Weekly chest: conta ogni partita completata (non forfeit)
+    if (!forfeit) {
+      try { await incrementWeeklyGames(); await updateLastActive(); } catch (e) { /* non bloccante */ }
+    }
+    await refreshCredits();
+    // shouldShowAd è ora in services/ads — controlla noAds/vip/birthday + grace 5 partite
+    // Ads strategy: mai dopo sconfitta frustrante (forfeit o partita < 30s)
+    const isFrustratingLoss = result === 'loss' && gameDurationSec < 30;
+    const showAdNow  = !forfeit && !isFrustratingLoss && await adsCheckShouldShow();
+
+    setTimeout(async () => {
+      if (aiTimer.current) clearTimeout(aiTimer.current);
+
+      const variantCfg     = Object.values(CONFIG.GAME_VARIANTS).find(x => x.id===v);
+      const supportsDouble = isOnline && variantCfg?.doubleMatch === true;
+
+      const params = {
+        result,
+        winnerPiece: st.winner,
+        variantId: v,
+        mode,
+        creditsEarned:   statsResult?.creditsEarned  || 0,
+        xpEarned:        statsResult?.xpEarned        || 0,
+        newLevel:        statsResult?.levelUp ? statsResult.newLevel : null,
+        previousLevel:   statsResult?.previousLevel ?? null,
+        newUnlocks:      statsResult?.newUnlocks       || [],
+        newAchievements: statsResult?.newAchievements  || [],
+        newMissions:     statsResult?.newMissions      || [],
+        rematchCost:     variant?.rematchCost ?? Math.ceil(cost/2),
+        leg,
+        leg1Result,
+        leg1Forfeit:     forfeit && supportsDouble,   // ← forfeit in doppia partita
+        pieceP1,
+        pieceP2,
+        difficulty: aiLevel || 'medium',
+        onRematch: async () => {
+          // Rematch spam guard: previeni doppi tap ravvicinati
+          const now = Date.now();
+          if (now - lastRematchRef.current < 1500) return;
+          lastRematchRef.current = now;
+          if (mode !== 'local') {
+            const ok = await trySpendCredits(rematchCost);
+            if (!ok) { return; }
+          }
+          navigate('game', { variantId: v, mode, aiLevel, p1Name, p2Name, pieceP1, pieceP2 });
+        },
+        onMenu:    () => navigate('home'),
+      };
+
+      if (_navigatingRef.current) return; _navigatingRef.current = true;
+      if (!showAdNow) { navigate('gameResult', params); return; }
+      const adShown = await showInterstitial();
+      if (!adShown) { navigate('gameResult', params); return; }
+      const { adInFlight } = getAdsState();
+      if (adInFlight) {
+        setShowAd(true);
+        _pendingResultRef.current = params;
+      } else {
+        await recordAdShown();
+        navigate('gameResult', params);
+      }
+    }, 900);
+  };
+
+  // Aggiorna il ref ad ogni render — nessuna stale closure possibile
+  handleGameOverRef.current = handleGameOver;
+
+  const doRematch = async () => {
+    setShowRematch(false);
+    if (mode !== 'local') {
+      const ok = await trySpendCredits(rematchCost);
+      if (!ok) { setShowNoCredits(true); return; }
+    }
+    winAnim.setValue(0);
+    setThinking(false);
+    if (aiTimer.current) clearTimeout(aiTimer.current);
+    startNewGame();
+  };
+
+  const goToMenu = useCallback(() => {
+    clearTurnTimer();
+    if (aiTimer.current) clearTimeout(aiTimer.current);
+    navigate('home');
+  }, [navigate]);
+
+  // ── RUOTA 3D RANDOM ───────────────────────────────────────
+  if (showInfoPanel) {
+    const wheelVariants = Object.values(CONFIG.GAME_VARIANTS)
+      .filter(v => v.id !== 'random')
+      .map(v => ({ id:v.id, name:v.name, icon:v.icon||'🎮', description:v.description }));
+    return (
+      <RandomSpinWheel
+        variants={wheelVariants}
+        onDone={onWheelDone}
+        themeColors={th}
+      />
+    );
+  }
+
+  if (!gameState) {
+    return (
+      <View style={[g.loading, { backgroundColor:th.bg }]}>
+        <Text style={[g.loadTxt, { color:th.textPrimary }]}>{t('loading')}</Text>
+      </View>
+    );
+  }
+
+  const v = gameState.chosenVariant || gameState.variant;
+  const isUltimate   = v === 'ultimate';
+  const variantLabel = chosenVariant
+    ? Object.values(CONFIG.GAME_VARIANTS).find(x=>x.id===chosenVariant)?.name||chosenVariant
+    : (variant?.name || variantId);
+
+  const winScale   = winAnim.interpolate({ inputRange:[0,1], outputRange:[0.7,1] });
+  // Variabile esplicita: true se il video copre i crediti mancanti per la rivincita
+  const videoWillUnlockRematch =
+    !adWatchLoading &&
+    canWatchVideo() &&
+    (credits + (CONFIG.CREDITS_VIDEO_REWARD || 5)) >= rematchCost;
+  const resultMsg  = gameState.isDraw ? 'Draw! 🤝'
+    : `${gameState.winner==='X'?(p1Name||'Player X'):mode==='ai'?'AI':'Player O'} Wins! 🎉`;
+  const resultEmoji = gameState.isDraw?'🤝':(mode==='ai'&&gameState.winner==='O')?'😔':'🏆';
+
+  return (
+    <View style={[g.root, { backgroundColor:th.bg }]}>
+
+      {/* QUIT */}
+      <Modal visible={showQuit} transparent animationType="fade" onRequestClose={()=>setShowQuit(false)}>
+        <View style={g.ov}>
+          <View style={[g.dlg, { backgroundColor:th.bgCard, borderColor:th.border }]}>
+            <Text style={g.di}>⚠️</Text>
+            <Text style={[g.dt, { color:th.textPrimary }]}>{t('leaveGame')}</Text>
+            <Text style={[g.dm, { color:th.textSecondary }]}>{t('leaveGameMsg')}</Text>
+            <View style={g.dbs}>
+              <TouchableOpacity style={[g.dbC, { backgroundColor:th.bgCard, borderColor:th.border }]} onPress={()=>setShowQuit(false)}>
+                <Text style={[g.dbCT, { color:th.textPrimary }]}>{t('keepPlaying')}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[g.dbQ, { borderColor:th.danger, backgroundColor:th.dangerBg }]}
+                onPress={async ()=>{
+                  setShowQuit(false);
+                  if (mode==='ai'&&gameState&&!gameState.gameOver) {
+                    await handleGameOver({...gameState,winner:'O',gameOver:true}, true);
+                    return; // handleGameOver naviga già via gameResult — non chiamare goToMenu()
+                  }
+                  if (mode==='online') {
+                    await handleGameOver({...gameState,winner:'O',gameOver:true}, true);
+                    return; // stessa ragione
+                  }
+                  goToMenu();
+                }}>
+                <Text style={[g.dbQT, { color:th.danger }]}>{t('quitGame')}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* AD INTERSTITIAL */}
+      <Modal visible={showAd} transparent animationType="slide">
+        <View style={g.ov}>
+          <View style={[g.dlg, { backgroundColor:'#050510', borderColor:'#2a2a4a' }]}>
+            <Text style={g.di}>📺</Text>
+            <Text style={{ color:'#808098', fontSize:14, marginBottom:12 }}>Advertisement</Text>
+            <View style={{ width:'100%', height:100, backgroundColor:'#050508', borderRadius:10, justifyContent:'center', alignItems:'center', marginBottom:16, borderWidth:1, borderColor:'#2a2a4a' }}>
+              <Text style={{ color:'#404050', fontSize:13 }}>[ AdMob Interstitial ]</Text>
+            </View>
+            <TouchableOpacity style={[g.dbC, { backgroundColor:'#1a1a2a', borderColor:'#2a2a4a', width:'100%' }]}
+              onPress={async ()=>{
+                setShowAd(false);
+                onInterstitialDismissed();    // rilascia mutex in services/ads
+                await recordAdShown();        // resetta contatori in storage
+                const pending = _pendingResultRef.current;
+                if (pending) { _pendingResultRef.current=null; navigate('gameResult', pending); }
+              }}>
+              <Text style={{ color:'#e0e0f0', fontWeight:'700' }}>Continue →</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* REMATCH */}
+      <Modal visible={showRematch} transparent animationType="fade">
+        <View style={g.ov}>
+          <View style={[g.dlg, { backgroundColor:th.bgCard, borderColor:th.border }]}>
+            <Text style={g.di}>{resultEmoji}</Text>
+            <Text style={[g.dt, { color:th.textPrimary }]}>{resultMsg}</Text>
+            <View style={g.dbs}>
+              <TouchableOpacity style={[g.dbQ, { borderColor:th.accent, backgroundColor:th.accentBg }]} onPress={doRematch}>
+                <Text style={[g.dbQT, { color:th.accent }]}>↺ {mode==='local'?'Yes! (free)':t('rematchCost',{cost:rematchCost})}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[g.dbC, { backgroundColor:th.bgCard, borderColor:th.border }]} onPress={()=>{ setShowRematch(false); goToMenu(); }}>
+                <Text style={[g.dbCT, { color:th.textPrimary }]}>🏠 {t('menu')}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* WILD */}
+      <Modal visible={!!wildPending} transparent animationType="fade">
+        <View style={g.ov}>
+          <View style={[g.dlg, { backgroundColor:th.bgCard, borderColor:th.border }]}>
+            <Text style={g.di}>{wildPending?.isOC?'⚔️':'🃏'}</Text>
+            <Text style={[g.dt, { color:th.textPrimary }]}>{t('wildChoose')}</Text>
+            <View style={g.dbs}>
+              {['X','O'].map(piece=>(
+                <TouchableOpacity key={piece}
+                  style={[g.dbC, { borderColor:piece==='X'?th.pieceX:th.pieceO, backgroundColor:piece==='X'?`${th.pieceX}22`:`${th.pieceO}22` }]}
+                  onPress={()=>{
+                    const p=wildPending; setWildPending(null);
+                    onPlayerMoved(p.player || gameState.currentPlayer);
+                    const ns=makeMoveClassic(gameState, p.cellIdx, piece);
+                    validateGameState(ns,'wild.human');
+                    setGameState(ns);
+                    if (ns.gameOver) handleGameOver(ns);
+                  }}>
+                  <Text style={{ color:piece==='X'?th.pieceX:th.pieceO, fontSize:26, fontWeight:'900' }}>
+                    {piece==='X'?showP(pieceX):showP(pieceO)}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <TouchableOpacity onPress={()=>setWildPending(null)} style={{marginTop:12}}>
+              <Text style={{ color:th.textMuted, fontSize:14 }}>{t('cancel')}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* PAUSA */}
+      <Modal visible={paused} transparent animationType="fade">
+        <View style={g.ov}>
+          <View style={[g.dlg, { backgroundColor:th.bgCard, borderColor:th.border }]}>
+            <Text style={g.di}>⏸️</Text>
+            <Text style={[g.dt, { color:th.textPrimary }]}>Game Paused</Text>
+            <TouchableOpacity style={[g.dbC, { width:'100%', backgroundColor:th.bgCard, borderColor:th.border }]} onPress={()=>setPaused(false)}>
+              <Text style={[g.dbCT, { color:th.textPrimary }]}>▶ Resume</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* NO CREDITI */}
+      <Modal visible={showNoCredits} transparent animationType="fade">
+        <View style={g.ov}>
+          <View style={[g.dlg, { backgroundColor:th.bgCard, borderColor:th.border }]}>
+            <Text style={g.di}>💰</Text>
+            <Text style={[g.dt, { color:th.textPrimary }]}>{t('notEnoughCredits')}</Text>
+            <Text style={[g.dm, { color:th.textSecondary }]}>{t('needCredits',{cost:rematchCost})} {t('youHaveCredits',{credits})}</Text>
+            <View style={g.dbs}>
+              {canWatchVideo() ? (
+                <TouchableOpacity
+                  style={[g.dbQ, {
+                    borderColor: th.accent,
+                    backgroundColor: adWatchLoading ? th.border : th.accentBg,
+                  }]}
+                  disabled={adWatchLoading}
+                  onPress={async () => {
+                    if (adWatchLoading) return;
+                    setAdWatchLoading(true);
+                    try {
+                      await showRewardedAd(async () => {
+                        // recordVideoWatched() già chiamato in ads.js — aggiorna solo UI
+                        await refreshCredits();
+                      });
+                    } catch (e) { /* intentionally ignored */ }
+                    setAdWatchLoading(false);
+                    setShowNoCredits(false);
+                  }}>
+                  <Text style={[g.dbQT, { color:th.accent }]}>
+                    {adWatchLoading ? '⏳…' : '📺 Guarda video → +5 crediti subito'}
+                  </Text>
+                  {videoWillUnlockRematch && (
+                    <Text style={{color:th.accent,fontSize:11,marginTop:3}}>
+                      Dopo il video puoi giocare subito
+                    </Text>
+                  )}
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity style={[g.dbQ, { borderColor:th.border, backgroundColor:th.bgCardAlt||th.bgCard }]} onPress={()=>setShowNoCredits(false)}>
+                  <Text style={[g.dbQT, { color:th.textMuted }]}>Limite video raggiunto</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity style={[g.dbC, { backgroundColor:th.bgCard, borderColor:th.border }]} onPress={()=>{ setShowNoCredits(false); goToMenu(); }}>
+                <Text style={[g.dbCT, { color:th.textPrimary }]}>🏠 {t('menu')}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* HEADER */}
+      <View style={[g.header, { borderBottomColor:th.border }]}>
+        <TouchableOpacity style={g.hBtn} onPress={()=>setShowQuit(true)} hitSlop={{top:12,bottom:12,left:12,right:12}}>
+          <Text style={[g.hBtnTxt, { color:th.textPrimary }]}>←</Text>
+        </TouchableOpacity>
+        <View style={{ alignItems:'center' }}>
+          <Text style={[g.hTitle, { color:th.textSecondary }]}>{variantLabel}</Text>
+          {/* Indicator leg online */}
+          {isOnline && leg > 1 && (
+            <Text style={{ fontSize:10, color:th.accent }}>↩️ Ritorno</Text>
+          )}
+          {gameState.isOrderChaos && (
+            <Text style={{ fontSize:10, color:th.accent }}>
+              {gameState.orderPlayer==='X'
+                ?`${p1Name||'P1'}: ORDER · ${p2Name||'P2'}: CHAOS`
+                :`${p1Name||'P1'}: CHAOS · ${p2Name||'P2'}: ORDER`}
+            </Text>
+          )}
+        </View>
+        <TouchableOpacity style={g.hBtn} onPress={()=>setPaused(true)} hitSlop={{top:12,bottom:12,left:12,right:12}}>
+          <Text style={[g.hBtnTxt, { color:th.accent }]}>⏸</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* TIMER BAR — solo online, non locale */}
+      {isOnline && !gameState.gameOver && (
+        <TurnTimerBar seconds={turnSec} totalSeconds={TURN_SEC} th={th} />
+      )}
+
+      {/* STATUS */}
+      <View style={g.statusBar}>
+        {gameState.gameOver ? (
+          <Animated.View style={{ transform:[{scale:winScale}] }}>
+            <Text style={[g.winTxt, { color:th.accent }]}>{resultMsg}</Text>
+          </Animated.View>
+        ) : (
+          <View style={g.turnRow}>
+            <View style={[g.pieceBadge, { backgroundColor: gameState.currentPlayer==='X'?`${th.pieceX}33`:`${th.pieceO}33` }]}>
+              <Text style={[g.pieceBadgeTxt, { color: gameState.currentPlayer==='X'?th.pieceX:th.pieceO }]}>
+                {gameState.currentPlayer==='X'?showP(pieceX):showP(pieceO)}
+              </Text>
+            </View>
+            <Text style={[g.turnTxt, { color:th.textPrimary }]}>
+              {thinking ? `🤖 ${t('aiThinking')}`
+               : mode==='local'
+                 ? `${gameState.currentPlayer==='X'?(p1Name||t('player1')):(p2Name||t('player2'))}'s turn`
+                 : t('playerTurn',{p:gameState.currentPlayer})}
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {/* BOARD */}
+      <View style={g.boardWrap}>
+        {isUltimate
+          ? <UltimateBoard gs={gameState} onCell={onCell} th={th} px={pieceX} po={pieceO} />
+          : <ClassicBoard  gs={gameState} onCell={(ci)=>onCell(0,ci)} th={th} px={pieceX} po={pieceO} />
+        }
+      </View>
+    </View>
+  );
+}
+
+// ── CLASSIC BOARD ─────────────────────────────────────────
+function ClassicBoard({ gs, onCell, th, px, po }) {
+  const size   = gs.boardSize;
+  const total  = width - 48;
+  const cellSz = Math.floor(total / size);
+  const actual = cellSz * size;
+  const showP  = (c) => c==='PHOTO'?'📸':(c||'?');
+  return (
+    <View style={{ width:actual, height:actual }}>
+      {Array.from({length:size},(_,row)=>(
+        <View key={row} style={{ flexDirection:'row', height:cellSz }}>
+          {Array.from({length:size},(_,col)=>{
+            const idx=row*size+col;
+            const cell=gs.board[idx];
+            const isWin=gs.winLine?.includes(idx);
+            const isLast=gs.lastMove===idx;
+            return (
+              <TouchableOpacity key={col} activeOpacity={0.6}
+                disabled={!!cell||gs.gameOver}
+                onPress={()=>onCell(idx)}
+                hitSlop={{top:2,bottom:2,left:2,right:2}}
+                style={{
+                  width:cellSz, height:cellSz,
+                  justifyContent:'center', alignItems:'center',
+                  backgroundColor: isWin?th.cellBgWin:isLast?th.cellBgLast:th.cellBg,
+                  borderRightWidth:col<size-1?2:0,
+                  borderBottomWidth:row<size-1?2:0,
+                  borderColor:th.boardBorder,
+                }}>
+                {cell&&(
+                  <Text style={{
+                    color:cell==='X'?th.pieceX:th.pieceO,
+                    fontSize:cellSz*0.52, fontWeight:'900',
+                    textShadowColor:cell==='X'?th.pieceX:th.pieceO,
+                    textShadowRadius:isWin?10:4,
+                  }}>
+                    {cell==='X'?showP(px):showP(po)}
+                  </Text>
+                )}
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      ))}
+    </View>
+  );
+}
+
+// ── ULTIMATE BOARD ────────────────────────────────────────
+function UltimateBoard({ gs, onCell, th, px, po }) {
+  const GAP=4, total=width-32;
+  const boardSz=Math.floor((total-GAP*2)/3);
+  const cellSz=Math.floor(boardSz/3);
+  const miniSz=cellSz*3;
+  const metaSz=boardSz*3+GAP*2;
+  const showP=(c)=>c==='PHOTO'?'📸':(c||'?');
+  return (
+    <View style={{ width:metaSz }}>
+      {[0,1,2].map(mRow=>(
+        <View key={mRow} style={{ flexDirection:'row', height:boardSz, marginBottom:mRow<2?GAP:0 }}>
+          {[0,1,2].map(mCol=>{
+            const bi=mRow*3+mCol;
+            const bw=gs.boardWinners[bi];
+            const fin=bw!==null;
+            const act=!gs.gameOver&&(gs.activeBoard===null||gs.activeBoard===bi);
+            const wib=gs.winLine?.includes(bi);
+            return (
+              <View key={mCol} style={{
+                width:boardSz, height:boardSz, marginRight:mCol<2?GAP:0,
+                backgroundColor:th.boardBg,
+                borderWidth:wib?2:act?2:1,
+                borderColor:wib?th.boardWin:act?th.boardActive:th.boardBorder,
+                borderRadius:6, overflow:'hidden',
+                justifyContent:'center', alignItems:'center',
+              }}>
+                {fin?(
+                  <View style={{ width:boardSz, height:boardSz, justifyContent:'center', alignItems:'center', backgroundColor:bw==='draw'?'rgba(50,50,70,0.5)':`${bw==='X'?th.pieceX:th.pieceO}18` }}>
+                    <Text style={{ fontSize:boardSz*0.52, fontWeight:'900', color:bw==='draw'?th.textMuted:bw==='X'?th.pieceX:th.pieceO, textShadowColor:bw==='draw'?'transparent':bw==='X'?th.pieceX:th.pieceO, textShadowRadius:12 }}>
+                      {bw==='draw'?'–':(bw==='X'?showP(px):showP(po))}
+                    </Text>
+                  </View>
+                ):(
+                  <View style={{ width:miniSz, height:miniSz }}>
+                    {[0,1,2].map(row=>(
+                      <View key={row} style={{ flexDirection:'row', height:cellSz }}>
+                        {[0,1,2].map(col=>{
+                          const ci=row*3+col;
+                          const cell=gs.boards[bi][ci];
+                          const wic=gs.boardWinLines?.[bi]?.includes(ci);
+                          const can=!cell&&!fin&&act&&!gs.gameOver;
+                          const last=gs.lastMove?.boardIndex===bi&&gs.lastMove?.cellIndex===ci;
+                          return (
+                            <TouchableOpacity key={col} activeOpacity={0.6} disabled={!can}
+                              onPress={()=>onCell(bi,ci)}
+                              hitSlop={{top:2,bottom:2,left:2,right:2}}
+                              style={{
+                                width:cellSz, height:cellSz,
+                                justifyContent:'center', alignItems:'center',
+                                backgroundColor:wic?th.cellBgWin:last?th.cellBgLast:can?th.cellBgCan:th.cellBg,
+                                borderRightWidth:col<2?1:0, borderBottomWidth:row<2?1:0,
+                                borderColor:th.boardBorder+'66',
+                              }}>
+                              {cell&&<Text style={{ color:cell==='X'?th.pieceX:th.pieceO, fontSize:cellSz*0.55, fontWeight:'900', textShadowColor:cell==='X'?th.pieceX:th.pieceO, textShadowRadius:4 }}>
+                                {cell==='X'?showP(px):showP(po)}
+                              </Text>}
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+                    ))}
+                  </View>
+                )}
+              </View>
+            );
+          })}
+        </View>
+      ))}
+    </View>
+  );
+}
+
+const g = StyleSheet.create({
+  root:      { flex:1 },
+  loading:   { flex:1, justifyContent:'center', alignItems:'center' },
+  loadTxt:   { fontSize:18, fontWeight:'600' },
+  header:    { flexDirection:'row', alignItems:'center', paddingHorizontal:12, paddingVertical:12, borderBottomWidth:1 },
+  hBtn:      { width:48, height:48, justifyContent:'center', alignItems:'center' },
+  hBtnTxt:   { fontSize:26, fontWeight:'600' },
+  hTitle:    { flex:1, textAlign:'center', fontSize:15, fontWeight:'800', letterSpacing:2 },
+  statusBar: { paddingVertical:10, alignItems:'center' },
+  turnRow:   { flexDirection:'row', alignItems:'center', gap:10 },
+  pieceBadge:{ width:38, height:38, borderRadius:8, justifyContent:'center', alignItems:'center' },
+  pieceBadgeTxt:{ fontSize:22, fontWeight:'900' },
+  turnTxt:   { fontSize:17, fontWeight:'700' },
+  winTxt:    { fontSize:22, fontWeight:'900', textAlign:'center' },
+  boardWrap: { flex:1, justifyContent:'center', alignItems:'center' },
+  ov:        { flex:1, backgroundColor:'rgba(0,0,0,0.8)', justifyContent:'center', alignItems:'center' },
+  dlg:       { width:width*0.85, borderRadius:20, padding:26, alignItems:'center', borderWidth:1 },
+  di:        { fontSize:44, marginBottom:10 },
+  dt:        { fontSize:21, fontWeight:'900', marginBottom:8 },
+  dm:        { fontSize:15, textAlign:'center', lineHeight:22, marginBottom:20 },
+  dbs:       { flexDirection:'row', gap:10, width:'100%' },
+  dbC:       { flex:1, borderRadius:12, padding:14, alignItems:'center', borderWidth:1 },
+  dbCT:      { fontWeight:'700', fontSize:14 },
+  dbQ:       { flex:1, borderRadius:12, padding:14, alignItems:'center', borderWidth:1 },
+  dbQT:      { fontWeight:'700', fontSize:14 },
+});
+
+const rp = StyleSheet.create({
+  root:    { flex:1, justifyContent:'center', alignItems:'center', padding:20 },
+  card:    { width:'100%', borderRadius:20, padding:24, alignItems:'center', borderWidth:2 },
+  title:   { fontSize:28, fontWeight:'900', marginBottom:16 },
+  iconBox: { marginBottom:12 },
+  name:    { fontSize:26, fontWeight:'900', marginBottom:6 },
+  grid:    { fontSize:14, marginBottom:14 },
+  rules:   { width:'100%', marginBottom:20 },
+  rule:    { fontSize:14, marginBottom:4 },
+  bottom:  { flexDirection:'row', alignItems:'center', justifyContent:'space-between', width:'100%' },
+  timer:   { fontSize:16 },
+  skipBtn: { borderRadius:12, paddingHorizontal:20, paddingVertical:10 },
+  skipTxt: { color:'#fff', fontWeight:'900', fontSize:15 },
 });
